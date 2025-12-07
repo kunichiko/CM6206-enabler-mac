@@ -58,6 +58,11 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <mach/mach.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <pwd.h>
+#include <limits.h>
+#include <mach-o/dyld.h>
 
 #include <CoreFoundation/CFNumber.h>
 
@@ -67,7 +72,7 @@
 #include <IOKit/usb/IOUSBLib.h>
 #include <IOKit/pwr_mgt/IOPMLib.h>
 
-#define CMVERSION "2.1"
+#define CMVERSION "3.0.0"
 
 // for debugging
 //#define VERBOSE
@@ -90,13 +95,278 @@ static int						gVerbose;
 
 void printUsage( const char *progName )
 {
-	printf("Usage: %s [-s] [-d] [-v] [-V]\n", progName );
-	printf("  Activates sound outputs on CM6206 USB devices.\n");
+	printf("Usage: %s [-s] [-d] [-v] [-V] [command]\n", progName );
+	printf("  Activates sound outputs on CM6206 USB devices.\n\n");
+	printf("Options:\n");
 	printf("  -s: Silent mode (default in daemon mode)\n");
 	printf("  -v: Verbose mode (default in non-daemon mode)\n");
 	printf("  -d: Daemon mode: the program keeps running and automatically activates any\n");
 	printf("      devices that are connected, or all devices upon wake-from-sleep.\n");
-	printf("  -V: Print version number and exit.\n");
+	printf("  -V: Print version number and exit.\n\n");
+	printf("Commands:\n");
+	printf("  install-agent      Install as LaunchAgent (auto-start on login, no sudo required)\n");
+	printf("  uninstall-agent    Uninstall LaunchAgent\n");
+	printf("  install-daemon     Install as LaunchDaemon (auto-start on boot, requires sudo)\n");
+	printf("  uninstall-daemon   Uninstall LaunchDaemon\n");
+}
+
+
+//================================================================================================
+// Get the path to the current executable
+//
+int getExecutablePath(char *buffer, size_t size) {
+	uint32_t bufsize = size;
+	if (_NSGetExecutablePath(buffer, &bufsize) != 0) {
+		fprintf(stderr, "Error: executable path buffer too small\n");
+		return -1;
+	}
+
+	// Resolve symlinks and relative paths
+	char realPath[PATH_MAX];
+	if (realpath(buffer, realPath) == NULL) {
+		fprintf(stderr, "Error: could not resolve executable path\n");
+		return -1;
+	}
+
+	strncpy(buffer, realPath, size);
+	return 0;
+}
+
+
+//================================================================================================
+// Install as LaunchAgent
+//
+int installLaunchAgent() {
+	char execPath[PATH_MAX];
+	char plistPath[PATH_MAX];
+	char launchAgentsDir[PATH_MAX];
+	struct passwd *pw = getpwuid(getuid());
+
+	if (pw == NULL) {
+		fprintf(stderr, "Error: could not get user home directory\n");
+		return -1;
+	}
+
+	// Get executable path
+	if (getExecutablePath(execPath, sizeof(execPath)) != 0) {
+		return -1;
+	}
+
+	// Create LaunchAgents directory if it doesn't exist
+	snprintf(launchAgentsDir, sizeof(launchAgentsDir), "%s/Library/LaunchAgents", pw->pw_dir);
+	mkdir(launchAgentsDir, 0755);
+
+	// Create plist path
+	snprintf(plistPath, sizeof(plistPath), "%s/com.kunichiko.cm6206-enabler.plist", launchAgentsDir);
+
+	// Create plist content
+	FILE *fp = fopen(plistPath, "w");
+	if (fp == NULL) {
+		fprintf(stderr, "Error: could not create plist file at %s\n", plistPath);
+		return -1;
+	}
+
+	fprintf(fp, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+	fprintf(fp, "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n");
+	fprintf(fp, "<plist version=\"1.0\">\n");
+	fprintf(fp, "<dict>\n");
+	fprintf(fp, "\t<key>Label</key>\n");
+	fprintf(fp, "\t<string>com.kunichiko.cm6206-enabler</string>\n");
+	fprintf(fp, "\t<key>ProgramArguments</key>\n");
+	fprintf(fp, "\t<array>\n");
+	fprintf(fp, "\t\t<string>%s</string>\n", execPath);
+	fprintf(fp, "\t\t<string>-d</string>\n");
+	fprintf(fp, "\t</array>\n");
+	fprintf(fp, "\t<key>RunAtLoad</key>\n");
+	fprintf(fp, "\t<true/>\n");
+	fprintf(fp, "\t<key>KeepAlive</key>\n");
+	fprintf(fp, "\t<true/>\n");
+	fprintf(fp, "\t<key>StandardErrorPath</key>\n");
+	fprintf(fp, "\t<string>%s/Library/Logs/cm6206-enabler.log</string>\n", pw->pw_dir);
+	fprintf(fp, "\t<key>StandardOutPath</key>\n");
+	fprintf(fp, "\t<string>%s/Library/Logs/cm6206-enabler.log</string>\n", pw->pw_dir);
+	fprintf(fp, "</dict>\n");
+	fprintf(fp, "</plist>\n");
+
+	fclose(fp);
+
+	// Load the plist
+	char command[PATH_MAX * 2];
+	snprintf(command, sizeof(command), "launchctl load '%s'", plistPath);
+	int result = system(command);
+
+	if (result == 0) {
+		printf("✓ Successfully installed as LaunchAgent\n");
+		printf("  Location: %s\n", plistPath);
+		printf("  The program will automatically start on login.\n");
+		printf("  Logs: ~/Library/Logs/cm6206-enabler.log\n");
+	} else {
+		fprintf(stderr, "Warning: plist created but launchctl load failed (exit code: %d)\n", result);
+		printf("You may need to manually load it with:\n");
+		printf("  launchctl load '%s'\n", plistPath);
+	}
+
+	return 0;
+}
+
+
+//================================================================================================
+// Uninstall LaunchAgent
+//
+int uninstallLaunchAgent() {
+	char plistPath[PATH_MAX];
+	struct passwd *pw = getpwuid(getuid());
+
+	if (pw == NULL) {
+		fprintf(stderr, "Error: could not get user home directory\n");
+		return -1;
+	}
+
+	snprintf(plistPath, sizeof(plistPath), "%s/Library/LaunchAgents/com.kunichiko.cm6206-enabler.plist", pw->pw_dir);
+
+	// Unload the plist
+	char command[PATH_MAX * 2];
+	snprintf(command, sizeof(command), "launchctl unload '%s' 2>/dev/null", plistPath);
+	system(command);
+
+	// Remove the plist file
+	if (unlink(plistPath) == 0) {
+		printf("✓ Successfully uninstalled LaunchAgent\n");
+		printf("  Removed: %s\n", plistPath);
+	} else {
+		fprintf(stderr, "Error: could not remove %s\n", plistPath);
+		fprintf(stderr, "The LaunchAgent may not be installed.\n");
+		return -1;
+	}
+
+	return 0;
+}
+
+
+//================================================================================================
+// Install as LaunchDaemon
+//
+int installLaunchDaemon() {
+	char execPath[PATH_MAX];
+	const char *plistPath = "/Library/LaunchDaemons/com.kunichiko.cm6206-enabler.plist";
+	const char *installDir = "/Library/Application Support/CM6206";
+	const char *installedBinary = "/Library/Application Support/CM6206/cm6206-enabler";
+
+	// Check if running as root
+	if (getuid() != 0) {
+		fprintf(stderr, "Error: Installing LaunchDaemon requires root privileges.\n");
+		fprintf(stderr, "Please run with sudo:\n");
+		fprintf(stderr, "  sudo %s install-daemon\n", getprogname());
+		return -1;
+	}
+
+	// Get executable path
+	if (getExecutablePath(execPath, sizeof(execPath)) != 0) {
+		return -1;
+	}
+
+	// Create installation directory
+	mkdir(installDir, 0755);
+
+	// Copy binary to installation directory
+	char cpCommand[PATH_MAX * 2];
+	snprintf(cpCommand, sizeof(cpCommand), "cp '%s' '%s'", execPath, installedBinary);
+	if (system(cpCommand) != 0) {
+		fprintf(stderr, "Error: failed to copy binary to %s\n", installedBinary);
+		return -1;
+	}
+	chmod(installedBinary, 0755);
+
+	// Create plist file
+	FILE *fp = fopen(plistPath, "w");
+	if (fp == NULL) {
+		fprintf(stderr, "Error: could not create plist file at %s\n", plistPath);
+		return -1;
+	}
+
+	fprintf(fp, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+	fprintf(fp, "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n");
+	fprintf(fp, "<plist version=\"1.0\">\n");
+	fprintf(fp, "<dict>\n");
+	fprintf(fp, "\t<key>Label</key>\n");
+	fprintf(fp, "\t<string>com.kunichiko.cm6206-enabler</string>\n");
+	fprintf(fp, "\t<key>ProgramArguments</key>\n");
+	fprintf(fp, "\t<array>\n");
+	fprintf(fp, "\t\t<string>%s</string>\n", installedBinary);
+	fprintf(fp, "\t\t<string>-d</string>\n");
+	fprintf(fp, "\t</array>\n");
+	fprintf(fp, "\t<key>RunAtLoad</key>\n");
+	fprintf(fp, "\t<true/>\n");
+	fprintf(fp, "\t<key>KeepAlive</key>\n");
+	fprintf(fp, "\t<true/>\n");
+	fprintf(fp, "\t<key>StandardErrorPath</key>\n");
+	fprintf(fp, "\t<string>/var/log/cm6206-enabler.log</string>\n");
+	fprintf(fp, "\t<key>StandardOutPath</key>\n");
+	fprintf(fp, "\t<string>/var/log/cm6206-enabler.log</string>\n");
+	fprintf(fp, "</dict>\n");
+	fprintf(fp, "</plist>\n");
+
+	fclose(fp);
+	chmod(plistPath, 0644);
+
+	// Load the plist
+	char command[PATH_MAX * 2];
+	snprintf(command, sizeof(command), "launchctl load '%s'", plistPath);
+	int result = system(command);
+
+	if (result == 0) {
+		printf("✓ Successfully installed as LaunchDaemon\n");
+		printf("  Binary: %s\n", installedBinary);
+		printf("  Plist: %s\n", plistPath);
+		printf("  The program will automatically start on system boot.\n");
+		printf("  Logs: /var/log/cm6206-enabler.log\n");
+	} else {
+		fprintf(stderr, "Warning: plist created but launchctl load failed (exit code: %d)\n", result);
+		printf("You may need to manually load it with:\n");
+		printf("  sudo launchctl load '%s'\n", plistPath);
+	}
+
+	return 0;
+}
+
+
+//================================================================================================
+// Uninstall LaunchDaemon
+//
+int uninstallLaunchDaemon() {
+	const char *plistPath = "/Library/LaunchDaemons/com.kunichiko.cm6206-enabler.plist";
+	const char *installedBinary = "/Library/Application Support/CM6206/cm6206-enabler";
+
+	// Check if running as root
+	if (getuid() != 0) {
+		fprintf(stderr, "Error: Uninstalling LaunchDaemon requires root privileges.\n");
+		fprintf(stderr, "Please run with sudo:\n");
+		fprintf(stderr, "  sudo %s uninstall-daemon\n", getprogname());
+		return -1;
+	}
+
+	// Unload the plist
+	char command[PATH_MAX * 2];
+	snprintf(command, sizeof(command), "launchctl unload '%s' 2>/dev/null", plistPath);
+	system(command);
+
+	// Remove the plist file
+	if (unlink(plistPath) == 0) {
+		printf("✓ Unloaded and removed plist: %s\n", plistPath);
+	} else {
+		fprintf(stderr, "Warning: could not remove %s (may not exist)\n", plistPath);
+	}
+
+	// Remove the binary
+	if (unlink(installedBinary) == 0) {
+		printf("✓ Removed binary: %s\n", installedBinary);
+	} else {
+		fprintf(stderr, "Warning: could not remove %s (may not exist)\n", installedBinary);
+	}
+
+	printf("✓ Successfully uninstalled LaunchDaemon\n");
+
+	return 0;
 }
 
 
@@ -215,7 +485,7 @@ void CheckError(IOReturn err, char* where) {
 //
 //================================================================================================
 
-int writeCM6206Registers( IOUSBInterfaceInterface183 **intf, UInt8 byte1, UInt8 byte2, UInt8 regNo )
+int writeCM6206Registers( IOUSBInterfaceInterface183 **intf, UInt8 regNo, UInt16 value )
 {
     UInt8 buf[8];
     IOReturn err;
@@ -223,8 +493,8 @@ int writeCM6206Registers( IOUSBInterfaceInterface183 **intf, UInt8 byte1, UInt8 
     UInt8 pipeNo = 0; // 0 is the default pipe (and the only one that works here)
     
     buf[0] = 0x20;
-    buf[1] = byte1;
-    buf[2] = byte2;
+    buf[1] = value & 0xFF;          // Low byte (DATAL)
+    buf[2] = (value >> 8) & 0xFF;   // High byte (DATAH)
     buf[3] = regNo;
     
     req.bmRequestType=USBmakebmRequestType(kUSBOut, kUSBClass, kUSBInterface );
@@ -245,41 +515,95 @@ int writeCM6206Registers( IOUSBInterfaceInterface183 **intf, UInt8 byte1, UInt8 
 void initCM6206(IOUSBInterfaceInterface183 **intf)
 {
     int err = 0;
-    
+    int successCount = 0;
+    const int totalCommands = 3;
+
     // This should reset the registers
-    if( writeCM6206Registers(intf, 0x00,0x00,0x00) ) {
-    	fprintf(stderr, "Error while resetting registers\n");
+    // REG0:
+    // bit15      DMA_Master       R/W 1: SPDIFOUT as Master 0: DACs as Master
+    // bit14-12   Sampling_rate    R/W SPDIF out sample rate (48K: 3'b010; 96K: 3'b110)
+    // bit11-4    Category_code    R/W SPDIF out category code depends on the equipment type
+    // bit3       Emphasis         R/W SPDIFOUT emphasis. 1: emphasis-CD_type 0: Emphasis is not indicated
+    // bit2       Copyright        R/W 1: not asserted; 0: asserted
+    // bit1       Non_audio        R/W 1: non-PCM audio data (like AC3) 0: PCM-data
+    // bit0       Pro_con          R/W 1: professional format 0: consumer
+    if( writeCM6206Registers(intf, 0x00, 0xa004) == 0 ) {  // REG0 = 0xa004 (S/PDIF Master, 48kHz, Copyright=not asserted)
+        successCount++;
+        if(gVerbose)
+            fprintf(stderr, "  [1/3] REG0 configuration (S/PDIF, sampling rate): OK\n");
+    } else {
+    	fprintf(stderr, "  [1/3] REG0 configuration (S/PDIF, sampling rate): FAILED\n");
 		err = 1;
     }
-    
+
     // This enables SPDIF, values copied from SniffUSB log (this one was easy)
     // I'm not sure if the SPDIF outputs surround data, as I don't have the means to test it.
-    if( writeCM6206Registers(intf, 0x00,0x30,0x01) ) {
-    	fprintf(stderr, "Error while attempting to enable SPDIF\n");
+    // REG1:
+    // bit15      Rsvd             R/W Reserved
+    // bit14      SEL_CLK          R/W For test. Select 44.1k source for DACs 1=from 22.58M 0=from 24.576M
+    // bit13      PLLBINen         R/W PLL binary search enable
+    // bit12      SOFTMUTEen       R/W Soft mute enable
+    // bit11      GPIO4_o          R/W Gpio4 signal
+    // bit10      GPIO4_OEN        R/W Gpio4 output enable
+    // bit9       GPIO3_o          R/W Gpio3 signal
+    // bit8       GPIO3_OEN        R/W Gpio3 output enable
+    // bit7       GPIO2_o          R/W Gpio2 signal
+    // bit6       GPIO2_OEN        R/W Gpio2 output enable
+    // bit5       GPIO1_o          R/W Gpio1 signal
+    // bit4       GPIO1_OEN        R/W Gpio1 output enable
+    // bit3       VALID            R/W SPDIFOUT Valid Signal 1=un-valid
+    // bit2       SPDIFLOOP        R/W SPDIF loop-back enable
+    // bit1       DIS_SPDIFO       R/W SPDIF out disable
+    // bit0       SPDIFMIX         R/W SPDIF in mix enable
+    /* 🍎 */
+    if( writeCM6206Registers(intf, 0x01, 0x2000) == 0 ) {  // REG1 = 0x2000 (PLLBINen=1)
+        successCount++;
+        if(gVerbose)
+            fprintf(stderr, "  [2/3] REG1 configuration (PLL binary search): OK\n");
+    } else {
+    	fprintf(stderr, "  [2/3] REG1 configuration (PLL binary search): FAILED\n");
 		err = 1;
     }
-    
+
     // This enables sound output. Why on earth it's disabled upon power-on,
     // nobody knows (except maybe some Taiwanese engineer).
     // These values were taken from the ALSA USB driver: "Enable line-out driver mode,
     // set headphone source to front channels, enable stereo mic."
     // That's for the CM106, however. On the CM6206 they appear to enable everything.
-    if( writeCM6206Registers(intf, 0x04,0x80,0x02) ) {
-    	fprintf(stderr, "Error while attempting to enable analog out\n");
+    // REG2:
+    // bit15      DRIVERON         R/W Line-out driver mode enable (1=enable)
+    // bit14-3    (various)        R/W Headphone source, channel config, etc.
+    // bit2       EN_BTL           R/W BTL mode enable (2-channel mode only) / Stereo mic enable
+    // bit1-0     (reserved)       R/W
+    if( writeCM6206Registers(intf, 0x02, 0x8004) == 0 ) {  // REG2 = 0x8004 (DRIVERON=1, EN_BTL=1)
+        successCount++;
+        if(gVerbose)
+            fprintf(stderr, "  [3/3] REG2 configuration (analog output, stereo mic): OK\n");
+    } else {
+    	fprintf(stderr, "  [3/3] REG2 configuration (analog output, stereo mic): FAILED\n");
     	err = 1;
     }
-    
+
     // Extra stuff, taken from the Alsa-user mailinglist.
     // The above works for me, so I didn't bother testing the following.
     // It may be completely redundant or make your Mac explode. Try at your own risk.
-    
+
     // "Enable DACx2, PLL binary, Soft Mute, and SPDIF-out"
-    //writeCM6206Registers(intf, 0x00,0xb0,0x01);
+    //writeCM6206Registers(intf, 0x01, 0xb000);
     // "Enable all channels and select 48-pin chipset"
-    //writeCM6206Registers(intf, 0x7f,0x00,0x03);
-    
-    if(!err && gVerbose)
-		fprintf(stderr, "Successfully sent CM6206 activation commands!\n");
+    //writeCM6206Registers(intf, 0x03, 0x007e);
+
+    // Print summary
+    if(successCount == totalCommands) {
+        if(gVerbose)
+            fprintf(stderr, "Successfully sent all CM6206 activation commands (%d/%d)\n",
+                    successCount, totalCommands);
+        else
+            fprintf(stderr, "Successfully sent CM6206 activation commands!\n");
+    } else {
+        fprintf(stderr, "Warning: Only %d/%d commands succeeded\n",
+                successCount, totalCommands);
+    }
 }
 
 
@@ -289,8 +613,9 @@ void dealWithInterface(io_service_t usbInterfaceRef)
     IOCFPlugInInterface 		**iodev;	// requires <IOKit/IOCFPlugIn.h>
     IOUSBInterfaceInterface183	**intf;
     SInt32						score;
-	
-	
+    int							interfaceOpened = 0;
+
+
     err = IOCreatePlugInInterfaceForService(usbInterfaceRef, kIOUSBInterfaceUserClientTypeID,
 											kIOCFPlugInInterfaceID, &iodev, &score);
     if (err || !iodev) {
@@ -305,14 +630,31 @@ void dealWithInterface(io_service_t usbInterfaceRef)
     }
     err = (*intf)->USBInterfaceOpen(intf);
     if (err) {
-		fprintf(stderr, "dealWithInterface: unable to open interface. ret = %08x\n", err);
+		// Try to seize the interface if open fails
 		// Alas, this doesn't solve the problem in OS X 10.4.*
 		err = (*intf)->USBInterfaceOpenSeize(intf);
 		if (err) {
-			fprintf(stderr, "dealWithInterface: unable to seize interface. ret = %08x\n", err);
-			return;
+			// On modern macOS, the interface may be held by the system's USB audio driver.
+			// However, we can still send USB control requests even without exclusive access.
+			// This is particularly important for kIOReturnExclusiveAccess (0xe00002c5).
+			if (err == kIOReturnExclusiveAccess) {
+				// This is expected on modern macOS - only show in verbose mode
+				if (gVerbose) {
+					fprintf(stderr, "dealWithInterface: interface held by system driver (expected)\n");
+					fprintf(stderr, "  Continuing without exclusive access (USB control requests will still work)\n");
+				}
+				// Continue to initCM6206() without setting interfaceOpened flag
+			} else {
+				// For other unexpected errors, show the error and abort
+				fprintf(stderr, "dealWithInterface: unable to open/seize interface. ret = %08x\n", err);
+				return;
+			}
+		} else {
+			interfaceOpened = 1;
 		}
-    }
+    } else {
+		interfaceOpened = 1;
+	}
 #ifdef VERBOSE
 	{
 		UInt8 numPipes;
@@ -328,12 +670,15 @@ void dealWithInterface(io_service_t usbInterfaceRef)
 #endif
 
 	initCM6206(intf);
-    
-    err = (*intf)->USBInterfaceClose(intf);
-    if (err) {
-		fprintf(stderr, "dealWithInterface: unable to close interface. ret = %08x\n", err);
-		return;
-    }
+
+    // Only try to close the interface if we successfully opened it
+    if (interfaceOpened) {
+		err = (*intf)->USBInterfaceClose(intf);
+		if (err) {
+			fprintf(stderr, "dealWithInterface: unable to close interface. ret = %08x\n", err);
+			// Don't return here, still try to release
+		}
+	}
     err = (*intf)->Release(intf);
     if (err) {
 		fprintf(stderr, "dealWithInterface: unable to release interface. ret = %08x\n", err);
@@ -431,7 +776,7 @@ void dealWithDevice(io_service_t usbDeviceRef)
     nCount = 0;
     while( (usbInterfaceRef = IOIteratorNext(iterator)) ) {
 #ifdef VERBOSE
-		fprintf(stderr, "found interface: %p\n", (void*)usbInterfaceRef);
+		fprintf(stderr, "found interface: %p\n", (void*)(size_t)usbInterfaceRef);
 #endif
 		if( nCount == 1 ) // The second interface is the one we need
 			dealWithInterface(usbInterfaceRef); // Here the actual interesting stuff happens!!!
@@ -577,7 +922,7 @@ void DeviceAdded(void *refCon, io_iterator_t iterator)
 void SignalHandler( int sigraised )
 {
 	if(gVerbose)
-		fprintf(stderr, "CM6206Init caught signal %d, exiting\n", sigraised);
+		fprintf(stderr, "cm6206-enabler caught signal %d, exiting\n", sigraised);
 	
     exit(0);
 }
@@ -628,9 +973,9 @@ int ActivateDevices()
     io_service_t		usbDeviceRef;
     int					nRet, foundDevice = 0;
 	
-	kr = IOMasterPort(MACH_PORT_NULL, &masterPort);
+	kr = IOMainPort(MACH_PORT_NULL, &masterPort);
 	if (kr) {
-		fprintf(stderr, "Error: Could not create master port, err = %08x\n", kr);
+		fprintf(stderr, "Error: Could not create main port, err = %08x\n", kr);
 		return kr;
 	}
 	
@@ -644,7 +989,7 @@ int ActivateDevices()
 	while ( (usbDeviceRef = IOIteratorNext(iterator)) ) {
 		foundDevice = 1;
 		if(gVerbose)
-			fprintf(stderr, "CM6206 found (device %p)\n", (void*)usbDeviceRef);
+			fprintf(stderr, "CM6206 found (device %p)\n", (void*)(size_t)usbDeviceRef);
 		dealWithDevice(usbDeviceRef);  // here the important stuff happens
 		IOObjectRelease(usbDeviceRef);	// no longer need this reference
 	}
@@ -686,8 +1031,8 @@ int main(int argc, const char * argv[])
 {
 	int					bDaemon = 0;
     sig_t				oldHandler;
-	gVerbose = 1;
-	
+	gVerbose = 0;  // Default to silent mode (use -v for verbose output)
+
 	for( int a=1; a<argc; a++ ) {
 		if( strcmp( argv[a], "-d" ) == 0 ) {
 			bDaemon = 1;
@@ -698,12 +1043,24 @@ int main(int argc, const char * argv[])
 		else if( strcmp( argv[a], "-s" ) == 0 )
 			gVerbose = 0;
 		else if( strcmp( argv[a], "-V" ) == 0 ) {
-			printf( "CM6206Init version %s\n", CMVERSION );
+			printf( "cm6206-enabler version %s\n", CMVERSION );
 			return 0;
 		}
-		else if( strcmp( argv[a], "-h" ) == 0 ) {
+		else if( strcmp( argv[a], "-h" ) == 0 || strcmp( argv[a], "--help" ) == 0 ) {
 			printUsage(argv[0]);
 			return 0;
+		}
+		else if( strcmp( argv[a], "install-agent" ) == 0 ) {
+			return installLaunchAgent();
+		}
+		else if( strcmp( argv[a], "uninstall-agent" ) == 0 ) {
+			return uninstallLaunchAgent();
+		}
+		else if( strcmp( argv[a], "install-daemon" ) == 0 ) {
+			return installLaunchDaemon();
+		}
+		else if( strcmp( argv[a], "uninstall-daemon" ) == 0 ) {
+			return uninstallLaunchDaemon();
 		}
 		else {
 			fprintf(stderr, "Ignoring unknown argument `%s'\n", (argv[a]));
@@ -737,7 +1094,7 @@ int main(int argc, const char * argv[])
 		if (nRet)
 			return nRet;
 
-		gNotifyPort = IONotificationPortCreate(kIOMasterPortDefault);
+		gNotifyPort = IONotificationPortCreate(kIOMainPortDefault);
 		runLoopSource = IONotificationPortGetRunLoopSource(gNotifyPort);
 		
 		gRunLoop = CFRunLoopGetCurrent();

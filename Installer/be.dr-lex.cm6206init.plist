@@ -6,7 +6,7 @@
 	<string>be.dr-lex.cm6206init</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/Library/Application Support/CM6206/cm6206init</string>
+		<string>/Library/Application Support/CM6206/cm6206-enabler</string>
 		<string>-d</string>
 	</array>
 	<key>RunAtLoad</key>

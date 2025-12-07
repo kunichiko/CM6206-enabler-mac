@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- USBデバイスへのアクセスを許可 -->
+	<key>com.apple.security.device.usb</key>
+	<true/>
+
+	<!-- IOKitユーザークライアントクラスへのアクセスを許可 -->
+	<key>com.apple.security.iokit-user-client-class</key>
+	<array>
+		<string>IOUSBDeviceUserClientTypeID</string>
+		<string>IOUSBInterfaceUserClientTypeID</string>
+	</array>
+</dict>
+</plist>
